@@ -1,0 +1,38 @@
+# HPC (GPU) dependencies -- do NOT reuse the CPU dry-run torch from requirements.txt.
+# The local CPU torch cannot drive vLLM; the cluster needs a CUDA build.
+#
+# INSTALL ORDER MATTERS. vLLM pins one exact torch CUDA build, so install vLLM FIRST
+# and let it pull the matching torch -- do not pin torch separately here and fight it.
+#
+#   1) check the cluster driver:            nvidia-smi   (note the CUDA version)
+#   2) pick the matching wheel index:       cu121 -> https://download.pytorch.org/whl/cu121
+#                                           cu124 -> https://download.pytorch.org/whl/cu124
+#   3) create env + install this file into it (conda/venv), then run the @slow tests
+#      (see README.md) to confirm vLLM<->HF logprob parity on THIS stack.
+#
+# Exact pins below are a STARTING POINT: reconcile the vLLM version with the cluster's
+# CUDA, then let transformers/accelerate follow what vLLM allows. Gate 1 requires the
+# SAME stack for the online and offline arms -- install once, use for both.
+
+# --- training / scoring stack (Qwen3-1.7B student + Qwen3-8B teacher) ---
+vllm>=0.6.6                 # pulls the matching CUDA torch; prompt_logprobs API = teacher scorer
+transformers>=4.51         # Qwen3 support (must match configs/template.py assumptions)
+accelerate>=1.0
+numpy
+pyyaml
+pytest
+matplotlib                  # scripts/plot_diagnostics.py (optional; job still writes jsonl without it)
+
+# --- wiki-18 retriever server (slurm/retriever_wiki18.sbatch runs Search-R1's own
+#     retrieval_server.py verbatim; the old self-built E5 server was removed) ---
+# Runs in the SAME conda env as training (env.sh activates OPD) but is a SEPARATE long-lived
+# job on its own node. Search-R1's server needs fastapi/uvicorn/datasets/pydantic ON TOP of
+# torch+transformers+faiss (the sbatch import-checks all of them before queuing the index
+# load). The index is HNSW on CPU, and patch_searchr1_cpu.py moves the encoder to CPU too,
+# so no GPU FAISS build is involved:
+faiss-cpu                   # read wiki18_index/e5_HNSW64.index + HNSW search on CPU
+# faiss-gpu-cu12            # ONLY if you rebuild the index as a GPU index (not this setup)
+fastapi                     # Search-R1 retrieval_server.py
+uvicorn                     # Search-R1 retrieval_server.py
+datasets                    # Search-R1 corpus loading (wiki-18.jsonl -> arrow)
+pydantic                    # Search-R1 request models

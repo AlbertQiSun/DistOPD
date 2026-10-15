@@ -1,0 +1,5 @@
+[
+  {"id": "nq_0", "question": "who sang who wants to be a millionaire in high society", "golden_answers": ["Frank Sinatra", "Celeste Holm"]},
+  {"id": "nq_1", "question": "what is the capital of france", "golden_answers": ["Paris"]},
+  {"id": "hpqa_0", "question": "The Eiffel Tower is located in the capital of which country?", "golden_answers": ["France"]}
+]

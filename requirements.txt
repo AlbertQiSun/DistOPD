@@ -1,0 +1,9 @@
+# Core (dry-run, CPU-capable)
+torch>=2.9
+numpy
+pyyaml
+pytest
+# HPC-only (install on cluster; not needed for CPU dry-run)
+# transformers>=4.51   # Qwen3 support
+# vllm>=0.6            # teacher/student rollout + prompt_logprobs
+# accelerate

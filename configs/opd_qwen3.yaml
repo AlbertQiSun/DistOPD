@@ -1,0 +1,350 @@
+# Real-run OPD config for HPC. Hyperparameters transcribed from Lightning OPD
+# (arXiv:2604.13010) Table 6, OPD stage. Recorded here so the real settings are
+# version-controlled; the LOCAL path uses `dry_run: true` (mock, CPU) instead.
+#
+# NOTE: three components below are HPC-only integration seams (see slurm/README.md):
+#   - retriever.endpoint : Search-R1 FastAPI retriever server (Wikipedia + E5)
+#   - data.path          : dataset of questions + gold answers (NQ/HotpotQA/2Wiki/...)
+#   - student generation : real pi_theta sampling (vLLM), replacing the scripted MockPolicy
+# The trainer, masking, teacher scoring, disk round-trip, and diagnostics are all
+# already proven (milestones 2-5); these seams are what turns the dry-run into a real run.
+
+run:
+  mode: online          # online | offline  (SLURM passes --mode to override)
+  dry_run: false        # true => mock CPU path (no models/retriever needed)
+  out_dir: runs
+  seed: 0
+
+model:
+  # Local HPC scratch paths (already staged; no HF download at train time).
+  #
+  # student INIT == the M-SFT pi_ref checkpoint (a full-SFT Qwen3-4B-Base, so the arch /
+  # weight shapes match Qwen3-4B by construction -- the checkpoint loads into the same 4B).
+  # OPD starts the student FROM pi_ref, NOT the raw base: a raw-base student induces dirty
+  # states from step 0, collapsing the OFFLINE premise, and "offline also fails" would be
+  # misread as off-dynamics when the real cause is a soft pi_ref (Stage-3 gate rationale).
+  # A 1.7B student is too small to imitate MiroThinker's agentic search -- a weak pi_ref
+  # floors BOTH OPD arms and hides the online-vs-offline signal we are here to measure.
+  # 4B is the floor. (Stage 3 PASSED 2026-07-23 on all three gates -> pi_ref cleared.)
+  student: ${OPD_STUDENT_CKPT}
+  # The TRAINED student (HF, full fwd+bwd + Adam) must NOT share a card with the online vLLM
+  # policy: vLLM grabs ~0.9 of its card for the KV cache (~85 GiB of a 95 GiB H20), leaving no
+  # room for the 4B weights + grads + Adam states -> CUDA OOM at student load. The online sbatch
+  # allocates gpu:h20:2 exactly so the policy (cuda:0) and student (cuda:1) get SEPARATE cards.
+  # This value is the ONLINE placement; when NO vLLM policy is built (offline read / precompute),
+  # scripts/train.py overrides the student to cuda:0 -- nothing occupies card 0 there, and forcing
+  # cuda:1 would be an "invalid device ordinal" on a node exposing only one card.
+  student_device: cuda:1
+  # STUDENT PRECISION -- deliberately NOT `dtype` below, which is the TEACHER's backend dtype
+  # and feeds gate 1's fingerprint (changing it would reject the precompute cache).
+  #
+  # fp32 PARAMETERS are load-bearing, not a memory preference. AdamW at lr 2e-6 moves a
+  # weight by ~2e-6; bf16's spacing near |w|=0.02 is 7.8e-5, i.e. 39x coarser, so the update
+  # rounds away. Measured over 150 steps: bf16 moved 4.4% of weights by a mean 1.2e-5, fp32
+  # moved 100% by 2.8e-4 -- a 22x smaller update concentrated on the smallest-magnitude
+  # weights. Training in bf16 here is a no-op that presents as a stable flat line, which is
+  # exactly the reading this phase exists to make impossible.
+  #
+  # fp32 also gives fp32 GRADIENT ACCUMULATION for free, which global_batch=256 needs: each
+  # micro contributes 1/256 = 3.9e-3 of the accumulator, and bf16's relative spacing is 2^-8
+  # = 3.9e-3 -- the same number. Measured 1.85% relative error on the accumulated gradient
+  # direction in bf16 vs 2.9e-7 in fp32, and it gets WORSE as global_batch grows.
+  #
+  # Lightning OPD's 2e-6 is not wrong; it assumes slime/Megatron's fp32 master weights. We
+  # copied the learning rate without the optimizer precision that makes it work.
+  student_param_dtype: float32
+  student_autocast_dtype: bfloat16     # the FORWARD still computes in bf16
+  # Teacher = MiroThinker-1.7-mini: an agentic-search specialist. "1.7" is the RELEASE
+  # VERSION, not a size -- the mini checkpoint is a 30B-A3B MoE (~30.5B total params,
+  # ~3B active/token), fine-tuned in the Qwen3-235B-A22B-Thinking-2507 lineage. So the
+  # teacher is substantially LARGER than the 4B student by total capacity (no inverted
+  # gap), while its ~3B active/token keeps per-token FLOPs comparable.
+  # Its tokenizer SEGMENTS IDENTICALLY to the student's, which is load-bearing -- OPD scores
+  # the student's exact ids position-by-position, so a teacher that segments differently
+  # would silently misalign every per-token advantage after the first divergence.
+  #
+  # MEASURED, not asserted: scripts/check_tokenizer_identity.py, run as certify gate 0.1.
+  # 2026-08-16, a100 channel, transformers 5.15.0: identical ids on all 47 probes -- every
+  # frozen template marker, the system prompt, an observation block, and the adversarial
+  # "string + one more character" pairs, which is where a merge difference actually bites.
+  #
+  # This comment used to read "vocab_size 151936; eos 151645 <|im_end|>" for the PAIR and was
+  # wrong on both counts -- which is what an unverified claim is for. The tokenizers report
+  # vocab_size 151643 (151936 is the model config's PADDED vocab, a different number), and the
+  # two eos ids DIFFER: teacher 151645 <|im_end|> from the Thinking lineage, student 151643
+  # <|endoftext|> inherited from Qwen3-4B-Base. That difference is expected and inert -- nothing
+  # here reads tokenizer.eos_token_id (the rollout appends the literal T.IM_END; vLLM stops on
+  # stop=[T.SEARCH_CLOSE, T.ANSWER_CLOSE]) -- and 151643 is positive evidence that pi_ref was
+  # SFT'd from the Base model rather than the Instruct one, which LlamaFactory's own record in
+  # the checkpoint README confirms (base_model: .../Qwen3-4B-Base).
+  teacher: ${OPD_TEACHER_MODEL}
+  dtype: bfloat16
+  # Teacher scoring backend. SAME for both modes = gate 1. LOCKED to `vllm_http`: the
+  # teacher is MiroThinker-1.7-mini, a 30B-A3B MoE -- HF's MoE forward is too slow/heavy
+  # for online per-step live scoring, so vLLM is the practical backend. It is served as
+  # an INDEPENDENT HTTP PROCESS on its own card (slurm/teacher_server.py), because true
+  # isolation from the policy's vLLM engine requires a separate PROCESS, not just a
+  # separate card (two vLLM V1 engines in one process interfere via CUDA graphs). The
+  # explicit `vllm_http` tag (vs a generic `vllm`) makes the BackendConfig fingerprint
+  # distinguish the served-HTTP path from any in-process vLLM logp. The in-process
+  # vllm/hf scorers remain CI/dry-run tools only; scripts/train.py hard-guards the real
+  # (non-dry-run) path to vllm_http.
+  engine: vllm_http
+
+optim:                          # Lightning OPD Table 6 (OPD stage)
+  # 150 = Lightning OPD Table 6, and it FITS. Measured on H20: 1.348 s/trajectory of training
+  # (weighted over the real length distribution) + 1.55 s/trajectory of rollout, so the ONLINE
+  # arm -- which does both in one job -- projects to 30.9h against a 48h walltime, 17h spare.
+  # offline is two jobs: 16.5h of precompute and 14.4h of training.
+  #
+  # This was briefly cut to 60 on a wrong premise (24h, which was a value earlier put in the
+  # sbatch files, not the cluster's limit). Nothing about the science asked for a smaller
+  # scale. This is the PLANNED maximum; the pre-registered stopping rule governs when a run
+  # actually ends: 3 consecutive 8-step windows in which KL rises AND cover_em falls AND mean
+  # trajectory length rises. Evaluated by scripts/check_stopping_rule.py, constants pinned by
+  # tests/test_stopping_rule.py, written down in README.md. Registered 2026-08-14,
+  # BEFORE any real run -- which is the only thing that makes stopping early defensible
+  # rather than a rule chosen after seeing the curves.
+  #
+  # 30.9h is still a bad shape to QUEUE -- backfill has gaps a 12h job fits and a 31h job does
+  # not -- which is why checkpoint/resume matters here. That is a scheduling argument, not a
+  # walltime one.
+  steps: 150
+  # WIRED (Task-2 step 4). OPDTrainer.step consumes this many trajectories per OPTIMIZER
+  # step via gradient accumulation: rollouts are gathered by the batched driver, the teacher
+  # scores them in token-budgeted requests, and each trajectory's loss is divided by
+  # global_batch before backward -- SEQUENCE-weighted, i.e. the mean of per-trajectory
+  # per-token means, matching the Lightning OPD reference implementation (see the
+  # normalisation section of opd/loss.py for the evidence chain and for why this is NOT
+  # veRL/Search-R1's token-mean). 256 and lr 2e-6 are exactly what the reference config
+  # configs/lightning_opd/qwen3-4b-lightning-opd.py uses.
+  global_batch: 256
+  lr: 2.0e-6
+  lr_schedule: constant
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+
+opd:
+  tau: 10.0                     # advantage clip [-tau, tau]
+  loss: opd                     # opd | delta  (delta = opd/delta_loss.py, offline only; train.py --loss)
+  beta: 1.0                     # delta arm: q_hat ∝ pi_ref · exp(beta · delta)   (train.py --beta)
+
+online:
+  # How often the vLLM inference engine pulls the current training weights.
+  # 1 = resync EVERY step = fully on-policy. This is the MAIN experiment: it makes
+  # the "online poisoning" claim unassailable (online cannot be secretly stale/offline).
+  # Larger N is an ABLATION only (staleness>0 on skipped steps, logged per record).
+  # Offline ignores this: its rollouts are frozen at precompute (staleness == step).
+  resync_every: 1
+
+rollout:
+  max_turns: 4
+  # MEASURED CEILING, not a guess. scripts/bench_train_step.py --find-max-length bisects the
+  # longest trajectory the student can actually train on: 16169 tokens on an H20 (95 GiB) with
+  # fp32 master weights, bf16 autocast, gradient checkpointing live. 15360
+  # leaves ~5% margin under that, because the bisection has 256-token resolution and the
+  # ceiling shifts with the scored-token fraction.
+  #
+  # A value ABOVE the ceiling is not a slow run, it is a job that dies hours in: the sampler
+  # would emit a trajectory the trainer cannot consume, and the first symptom is an OOM after
+  # the queue wait and the model load. Re-measure on any new hardware before raising it.
+  # (It was 16384 while an eval-mode bug held the real ceiling at 5458 -- see teacher/scorer.py.)
+  max_len: 15360                # WHOLE-trajectory budget (prompt + max_turns turns + each turn's
+                                # top_k retrieved full passages), shared by SFT-gen / online rollout /
+                                # offline precompute. Raised 4096->16384: at 4096 ~45% of multi-hop
+                                # SFT trajectories hit the cap (observation-dominated: top_k=3 Wikipedia
+                                # full texts x 4 turns), truncating MiroThinker's longest reasoning.
+                                # No memory cost (model max_model_len is 256k); cost is compute on the
+                                # long tail. Keep Step C --cutoff-len in gen_sft.sbatch IN SYNC.
+  # PER-ACTION sampling cap. MEASURED, 2026-08-21, runs/cap_probe_{miro,moe,dense}: 64
+  # questions per teacher at cap 4096 and max_len 22528, so the distribution is uncensored in
+  # BOTH dimensions (raising only the cap would move the clipping from the action to the
+  # trajectory). at-cap came back 0.0% for every teacher's query turns, which is what makes
+  # the percentiles below readable at all.
+  #
+  #   query turns          p50   p90    p95    p99    max
+  #     MiroThinker         37   112    166    279    740
+  #     Qwen3-32B          132   483    624    701   1101
+  #     Qwen3-30B-A3B      301  1262   1666   2152   2372     <- the binding teacher
+  #   final answer action
+  #     MiroThinker         94   193    308   1054   4096 (one case)
+  #     Qwen3-32B           97   358    478    857   1406
+  #     Qwen3-30B-A3B       62   441    837   1485   2269
+  #
+  # 2560 clears the most verbose teacher's observed MAX (2372), not just its p99, so the cap
+  # is non-binding for all three and the three-line comparison carries no residual asymmetry
+  # on this axis. It also fits the trajectory budget in the pathological case: 5 actions
+  # (4 turns + the forced-answer turn) x 2560 + ~1370 of prompt and observations = 14170 <
+  # max_len 15360, so a run of maximal actions still cannot be clipped by max_len either.
+  #
+  # COST, measured on the same probe: 10.3 s/question for the MoE against 8.8 at cap 512,
+  # 25.0 vs 21.6 dense, 3.1 vs 2.6 MiroThinker -- 15-20%, because the cap was only ever
+  # cutting the tail.
+  #
+  # WHAT THE OLD 512 WAS DOING (it was a Python default no call site passed): 100% of
+  # Qwen3-30B-A3B's empty_query drops and 78% of Qwen3-32B's sat exactly at it, and removing
+  # it took the MoE's empty_query rate from 50% of trajectories to ZERO while natural
+  # termination went 53.1% -> 62.5%. MiroThinker's natural rate did not move at all (26.6%
+  # both ways), which is what a cap that never bound it should look like.
+  #
+  # 2372 is the max over 222 actions from 64 questions, not a population maximum -- at 3000
+  # questions the tail will run longer and 2560 will clip something. That is why the health
+  # report now prints the at-cap fraction on every shard: this number is monitored, not
+  # assumed. If it starts biting, raise it and say so; do not let it bind silently again.
+  max_action_tokens: 2560
+  # OFF, and measured. vLLM reuses the KV of a shared prefix instead of recomputing it; that
+  # made Qwen3-32B NON-REPRODUCIBLE. ab_dense_v2 and ab3_dense_v2_terse ran identical engine
+  # settings (max_model_len 17408, util 0.858, cap 512, max_len 15360), the same 64 questions
+  # and the same seed, and gave answered 84.4% vs 90.6%, answer words p50 27 vs 34.
+  # MiroThinker and Qwen3-30B-A3B were byte-identical across the same pair -- only the dense
+  # model's KV pool is small enough to EVICT (256 KiB/token at util 0.858 holds ~24k tokens,
+  # against ~60k for the two 96 KiB/token models), and eviction is what decides cache-hit
+  # versus recompute. The two paths accumulate differently in bf16 and temperature 0.6 turns
+  # that into a different sample.
+  #
+  # THE TEST, runs/det_dense_nopfx_{A,B} 2026-08-22: two Qwen3-32B runs with caching OFF came
+  # back 64/64 IDENTICAL, compared on the whole trajectory -- every turn's text, every turn's
+  # token count, the termination reason and the final action -- not merely on the answer.
+  #
+  # COST, from the same runs: 22.29 -> 21.61 action tok/s, -3.1%, and that is an UPPER bound
+  # because the comparison shard also used a different prompt variant. (I predicted ~2% from
+  # prefill arithmetic; the measurement is what stands.)
+  #
+  # This buys the property a released dataset needs: a shard is reproducible from (model,
+  # prompt, seed, data). Prefix caching had already cost this project once from the other
+  # direction -- 79407b7, on in the ONLINE policy, so weight hot-updates left stale KV.
+  enable_prefix_caching: false
+  # VLLM_BATCH_INVARIANT for the SFT-GENERATION engine. OFF, pending its own measurement.
+  #
+  # rollout/engine.py pins it ON for the policy, on measured grounds: without it, batch
+  # COMPOSITION changes the sampled tokens -- the probe flipped 6/6 greedy comparisons and
+  # 12/12 sampled ones -- and a real rollout puts each trajectory through ~7 different batch
+  # compositions as the batch desynchronises. Cost there: 2.10x policy wall clock.
+  #
+  # WHY IT IS NOT SIMPLY COPIED HERE. That failure mode needs a batch to vary, and SFT
+  # generation is SERIAL: sft/datagen.py drives generate_trajectory (singular), one request at
+  # a time, so the composition is always 1 and never changes. The prediction is that the flag
+  # buys nothing on this path, and runs/det_dense_nopfx_{A,B} is evidence for it -- 64/64
+  # byte-identical trajectories on the model that WAS non-reproducible, with the flag off.
+  #
+  # It is exposed anyway because that evidence covers ONE teacher. MiroThinker and
+  # Qwen3-30B-A3B have never been tested for reproducibility; they were only ever observed
+  # not to differ, across two rounds that both ran with prefix caching ON. Not-observed is
+  # not tested. If either fails its A/B pair, this is the next lever, and its cost on THIS
+  # workload gets measured rather than extrapolated from the policy's 2.10x -- generation
+  # samples longer actions from a larger model with no batching at all.
+  batch_invariant_generation: false
+  top_k: 3                      # retrieved docs per search
+  temperature: 0.8              # Table 6 sampling temp
+  top_p: 1.0
+
+template:                       # FROZEN -- must match teacher.backend.template_fingerprint()
+  enable_thinking: true         # teacher (MiroThinker) is Thinking-lineage; its multi-hop
+                                # competence lives in the native <think> channel. false pre-fills
+                                # a closed empty <think></think> that suppresses reasoning (see
+                                # scripts/probe_think_template.py). Safe because we never re-render.
+  add_generation_prompt: true
+
+retriever:
+  # HPC SEAM 1 -- Search-R1 FastAPI retriever (Wikipedia + E5-large-v2), a SEPARATE
+  # long-lived process on its OWN GPU allocation (loads the FAISS index once). Set <host>
+  # to that retriever job's `hostname -f`; the path MUST be /retrieve. Staged index/encoder
+  # paths + launch args are in README.md Part 0.3 / Part 1 Step 1.
+  # HTTPRetriever (envs/http_retriever.py)
+  # POSTs {"queries": [q], "topk": <rollout.top_k>, "return_scores": true} and reads
+  # body["result"][0] as a list of docs ({"document": {"contents": ...}} | {"contents": ...} | str).
+  # Verify before training:  curl -s -X POST http://<host>:8000/retrieve \
+  #   -H 'Content-Type: application/json' \
+  #   -d '{"queries":["capital of France"],"topk":3,"return_scores":true}'
+  endpoint: "http://REPLACE_ME:8000/retrieve"
+
+teacher:
+  # HPC SEAM 3 -- MiroThinker served by vLLM as a SEPARATE long-lived process on its
+  # OWN card (slurm/teacher_server.py), mirroring the retriever. Set <host> to that
+  # teacher job's `hostname -f`; the path MUST be /score_logprobs. The server pins
+  # VLLM_BATCH_INVARIANT=1 + enforce_eager + prefix-caching OFF (gate-3a determinism).
+  # TeacherHTTPScorer (teacher/http_scorer.py) POSTs the FROZEN input_ids verbatim
+  # (pure-id contract -- never detok->retok across the boundary) and reads back
+  # align-to-t logprobs. It also GETs /health at startup and asserts the served
+  # backend fingerprint == the client's (cross-service gate 1).
+  # Verify before training:  curl -s -X POST http://<host>:8100/score_logprobs \
+  #   -H 'Content-Type: application/json' -d '{"input_ids":[1,2,3,4]}'
+  # Overridable at run time with scripts/train.py --teacher-endpoint (keeps this pristine).
+  endpoint: "http://REPLACE_ME:8100/score_logprobs"
+
+data:
+  # HPC SEAM 2 -- questions + gold answers. JSONL (one obj/line) OR a JSON array.
+  # Accepted gold fields, in priority order (dataio/dataset.py::extract_gold):
+  #   golden_answers: [...]   # Search-R1 unified processed format (PREFERRED)
+  #   answers: [...]          # NQ-style multi short-answer
+  #   answer: {value, aliases, normalized_aliases}   # TriviaQA raw
+  #   answer: "single string" # HotpotQA / 2Wiki / Musique raw
+  # gold is ALWAYS coerced to an alias LIST; hit@k is OR over aliases w/ the shared normalizer.
+  # Rows missing a question or any gold alias are DROPPED (cannot score answer-recall).
+  # HotpotQA TRAIN, on the UNUSED slice past the prefix SFT consumed (2-hop, clean answer
+  # testbed; biggest cover_em lift +0.259 on the Stage-3 intersection). musique is
+  # retrieval-floored / low-SNR -- do NOT use it for the online-vs-offline answer read.
+  #
+  # WHY TRAIN AND NOT DEV: pi_ref must not have memorized these questions, but that only
+  # rules out the SFT-SEEN rows -- it does NOT require dev. Standard practice is SFT on one
+  # train subset, OPD/RL on a DISJOINT train subset, dev kept whole for eval. HotpotQA train
+  # is ~90k and SFT used only the first 2000, so the other ~88k are equally unmemorized AND
+  # cost zero eval resource. Spending dev here would (a) make the Stage-3 pi_ref dev numbers
+  # unusable as a baseline (they would overlap the OPD training rows), forcing a pi_ref
+  # re-run, and (b) carve the eval set up again every time OPD scale grows.
+  # PAYOFF: dev stays whole -> eval runs/ckpt_{online,offline} on the SAME 200-Q dev slice
+  # Stage 3 used, and the pi_ref baseline is just the Stage-3 numbers. No re-run.
+  path: "${OPD_SFT_DATA_DIR}/hotpotqa_with_gold.jsonl"
+  name: null                   # optional dataset hint for the raw-format fallback (unused if golden_answers present)
+  # Skip the VALID rows SFT consumed (sft.data.sources hotpotqa limit = 2000). Selection is
+  # deterministic first-N in file order, so a contiguous offset is disjoint BY CONSTRUCTION.
+  # This value is NOT load-bearing on its own: scripts/train.py::_assert_disjoint_from_sft
+  # reconstructs the SFT-consumed set from sft.data.sources (NOT from this offset -- that
+  # would be self-referential) and fails loud on any overlap, so a wrong offset cannot pass
+  # silently. Raise it, never lower it, as OPD consumes more of the unused ~88k.
+  offset: 2000
+  # limit x epochs MUST equal steps x global_batch -- scripts/train.py asserts it and refuses
+  # to start otherwise. The product is the number of DRAWS each arm makes; `epochs` is how
+  # many times each question is revisited.
+  #
+  # WHY THIS IS A CONFOUND AND NOT BOOKKEEPING. Both sources walk questions[i % limit], but a
+  # revisit means different things: ONLINE re-samples the policy and gets a fresh trajectory,
+  # OFFLINE re-reads the same cached one. So at epochs=E, online sees E distinct trajectories
+  # per question and offline sees one, repeated E times. E is therefore a second independent
+  # variable -- data diversity -- sitting beside the one this experiment is about. The
+  # previously shipped combination (limit 64, steps 150, global_batch 256) had E = 600.
+  #
+  # epochs: 1 is the apples-to-apples setting and additionally PAIRS the arms: step k draws
+  # the same questions on both sides. A larger E is a legitimate smoke test and an
+  # illegitimate experiment; the assert exists so the difference cannot be silent.
+  limit: 38400                 # = steps(150) x global_batch(256). Raise both together.
+  epochs: 1
+
+diagnostics:
+  enabled: true
+  every: 1                      # emit a DiagnosticRecord every N steps
+  precompute_dir: precomputed   # offline teacher-logp cache (gitignored)
+
+sft:                            # M-SFT Stage 1: MiroThinker SFT-data generation (-> pi_ref)
+  # Generation temp is INTENTIONALLY below the OPD rollout's 0.8: SFT wants MiroThinker's
+  # MOST coherent search for pi_ref to imitate; 0.8 (an EXPLORATION temp) raises the
+  # unproductive-spinning rate. Ablatable via --temperature.
+  temperature: 0.6
+  # REPORT-ONLY bucket boundary for scripts/check_sft_stats.py: at/above this hop count a
+  # never-hit trajectory is labelled "spinning" in the health report. It does NOT gate
+  # datagen -- SFT takes MiroThinker's distribution as-is (zero quality filtering); spinning
+  # trajectories are KEPT. It only shapes how the check script reports productive-vs-spinning.
+  spin_min_hops: 3
+  data:
+    # Difficulty-mixed question sources (HPC SEAM -- fill real paths). Per-source `limit`
+    # sets the mix (~30% 1-hop / 50% 2-hop / 20% multi-hop). `tag` is provenance only; the
+    # REALIZED hop distribution is measured by scripts/check_sft_stats.py, not by the tag.
+    # With zero quality filtering, KEPT ~= generated minus a tiny structural-drop tail
+    # (no_action/empty_query/empty_answer), so budget ~3000-3200 questions for a first ~3000
+    # KEPT batch to unblock Stage 2 (NOT the old 4000+ -- there is no quality attrition now).
+    total: null                 # optional cap after mixing (null = use all)
+    sources:
+      - {path: "${OPD_SFT_DATA_DIR}/nq_with_gold.jsonl",        tag: "1hop",     limit: 1200}
+      - {path: "${OPD_SFT_DATA_DIR}/hotpotqa_with_gold.jsonl",  tag: "2hop",     limit: 2000}
+      - {path: "${OPD_SFT_DATA_DIR}/musique_with_gold.jsonl",   tag: "multihop", limit: 800}

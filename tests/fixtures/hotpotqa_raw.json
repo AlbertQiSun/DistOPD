@@ -1,0 +1,8 @@
+[
+  {"question": "What is the height of the tower located in the capital of France?",
+   "answer": "330 metres",
+   "supporting_facts": [["Eiffel Tower", 0], ["Paris", 0]]},
+  {"question": "Who directed the 1994 film that won Best Picture?",
+   "answer": "Robert Zemeckis",
+   "supporting_facts": [["Forrest Gump", 0], ["67th Academy Awards", 1]]}
+]

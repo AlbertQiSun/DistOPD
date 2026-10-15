@@ -1,0 +1,20 @@
+# H20 cluster, H20 95.1 GiB, torch 2.11.0+cu130 / vLLM 0.25.1.
+# The baseline: these are the values the committed measurements were taken on.
+name: h20
+
+model:
+  # 15 (fp32 weights) + 15 (grads) + 30 (Adam) + 7.5 (autocast weight-cast cache) = 67.5 GiB
+  # fixed, measured 67.7. With ~4 GiB of per-trajectory cost at the longest real trajectory
+  # the peak is 71.6 of 95.1 -- 23.5 GiB spare, so the cache stays on and costs nothing here.
+  autocast_cache: true
+  student_device: cuda:1          # online: vLLM owns cuda:0
+
+opd:
+  logprob_chunk_rows: 1024        # ~1.24 GiB transient at V=151936
+
+rollout:
+  # MEASURED ceiling 16169 tokens (bench --find-max-length); 15360 leaves ~5% margin.
+  max_len: 15360
+
+teacher:
+  gpu_memory_utilization: 0.72    # 68.4 GiB of 95.1

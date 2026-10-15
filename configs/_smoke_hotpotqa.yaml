@@ -1,0 +1,54 @@
+run:
+  mode: online
+  dry_run: false
+  out_dir: runs
+  seed: 0
+model:
+  student: ${OPD_MODELS_DIR}/Qwen3-4B-Base
+  teacher: ${OPD_TEACHER_MODEL}
+  dtype: bfloat16
+  engine: vllm_http
+optim:
+  steps: 150
+  global_batch: 256
+  lr: 2.0e-06
+  lr_schedule: constant
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+opd:
+  tau: 10.0
+online:
+  resync_every: 1
+rollout:
+  max_turns: 4
+  max_len: 16384
+  top_k: 3
+  temperature: 0.8
+  top_p: 1.0
+  # Required, not optional: VLLMPolicy has no default for it any more.
+  max_action_tokens: 2560
+template:
+  enable_thinking: false
+  add_generation_prompt: true
+retriever:
+  endpoint: http://REPLACE_ME:8000/retrieve
+teacher:
+  endpoint: http://REPLACE_ME:8100/score_logprobs
+data:
+  path: REPLACE_ME/questions_with_gold.jsonl
+  name: null
+  limit: null
+diagnostics:
+  enabled: true
+  every: 1
+  precompute_dir: precomputed
+sft:
+  temperature: 0.6
+  spin_min_hops: 3
+  data:
+    total: 64
+    sources:
+    - path: ${OPD_SFT_DATA_DIR}/hotpotqa_with_gold.jsonl
+      tag: 2hop
+      limit: 64

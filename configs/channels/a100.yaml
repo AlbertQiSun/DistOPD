@@ -1,0 +1,72 @@
+# A100 cluster, A100 80 GB (~79.2 GiB usable), driver 580.126.20 / CUDA 13.0.
+# The driver supports CUDA 13, so this channel runs the SAME torch 2.11.0+cu130 and vLLM
+# 0.25.1 as h20 -- only the architecture differs (sm_90 -> sm_80). That is why the version
+# risk that would have come with an older vLLM does not apply here.
+name: a100
+
+model:
+  # 15.9 GiB LESS card than the H20. The fixed cost alone (67.5 GiB) plus per-trajectory cost
+  # would leave under 1 GiB, which is not a margin. Turning off the autocast weight-cast
+  # cache frees ~7.5 GiB: each linear re-casts its weight on the fly instead of keeping a
+  # bf16 copy of every parameter. ZERO numerical risk -- it changes only where a temporary
+  # lives -- but it costs speed, and MORE than the naive estimate because gradient
+  # checkpointing re-casts again on every recompute.
+  #
+  # MEASURED, gate 6 on <node>, 2026-08-17: peak 74.9 / 79.2 GiB with this off, i.e. it fits
+  # with 4.3 GiB to spare. NOT measured: what the peak would be with the cache ON, so the
+  # ~7.5 GiB figure above remains an estimate and the speed cost is unquantified -- the bench
+  # ran one setting, which can show that this one works and nothing about the other.
+  autocast_cache: false
+  student_device: cuda:1
+
+opd:
+  logprob_chunk_rows: 512         # halved: ~0.62 GiB transient instead of ~1.24
+
+rollout:
+  # NO LONGER PROVISIONAL, but read what was and was not measured -- they are not the same.
+  #
+  # gate 6 on <node>, 2026-08-17 (runs/bench_a100.json). Every probed length TRAINED:
+  # 2674, 9529, 12956, 14670, 15527, 15955, 16169 tokens, not one OOM. 15360 sits below the
+  # two largest measured-fitting lengths, so the trainer can consume everything the sampler
+  # can produce. THAT is the decision this gate owed, and it is settled.
+  #
+  # WHAT WAS NOT MEASURED: the card's actual ceiling. The old search bisected [2674, 16384]
+  # and, with every probe fitting, returned `hi` minus its 256 stopping tolerance -- 16169 --
+  # and printed it as "longest trajectory that fits on this card". The H20 printed the same
+  # 16169. Two cards with different memory budgets cannot share a limit to the token; the
+  # number was arithmetic, not a measurement. Fixed in scripts/bench_train_step.py
+  # (search_length_ceiling probes hi first and reports "> hi" when nothing OOMs);
+  # tests/test_length_ceiling_search.py holds the case at those exact numbers.
+  #
+  # WHY nothing OOMs, from the same log: peak memory was 74.9 GiB at 708 tokens and 74.9 GiB
+  # at 13750. Length barely moves it, because the peak is the pi_ref page-in during the
+  # diagnostic -- ~15 weights + 15 grads + 30 Adam + 15 pi_ref. The binding constraint on this
+  # card is that FIXED 74.9 / 79.2 GiB (95%, 4.3 GiB headroom), not trajectory length. A
+  # fragmented allocator or anything else resident will OOM here at ANY length, and raising
+  # max_len is close to free in memory terms -- neither of which is what a "16169-token
+  # ceiling" would have told anyone.
+  max_len: 15360
+
+teacher:
+  # MEASURED, gate 0.5 on <node>, 2026-08-16 (runs/gate_log.jsonl a100:0.5-teacher-loads-and-
+  # scores). It replaces a PROVISIONAL 0.88 that nothing had tested.
+  #
+  #   0.72  57.1 GiB budget - 56.93 GiB weights  ->  KV cache -1.24 GiB, engine refuses to start
+  #   0.80  63.4 GiB budget - 56.93 GiB weights  ->  KV cache 5.1 GiB = 55,696 tokens, and a
+  #         16384-token sequence scores end to end (prompt_logprobs len 16384)
+  #
+  # The 0.72 failure is the H20 pin arriving on a smaller card, exactly as predicted from
+  # 0.72 x 79.2 = 57.0 GiB being less than the weights -- and it fails at KV allocation, not at
+  # the weight load, which is the shape that prediction implies.
+  #
+  # THIS IS PART OF THE CHANNEL'S IDENTITY, not a tuning knob: gpu_memory_utilization is a
+  # BackendConfig ENGINE_RUNTIME_FIELD, so a cache scored at 0.80 and a run at 0.88 have
+  # different fingerprints and gate 1 refuses the pairing. Changing it means re-certifying.
+  #
+  # KV HEADROOM IS TIGHTER THAN H20'S and is the number a future throughput question starts
+  # from: 5.1 GiB here vs ~11.5 GiB there, i.e. max concurrency 3.20x at 17,408 tokens per
+  # request. Raising the utilization would buy KV back -- but only AFTER measuring that KV is
+  # what limits precompute throughput. Changing a numerical parameter in response to a slow run
+  # without measuring the cause is the failure mode the project's root-cause rule exists for, and
+  # it has been wrong here nearly every time.
+  gpu_memory_utilization: 0.80

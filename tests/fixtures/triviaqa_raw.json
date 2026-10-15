@@ -1,0 +1,10 @@
+[
+  {"question": "Which US state is nicknamed the Sunshine State?",
+   "answer": {"value": "Florida",
+              "aliases": ["Florida", "State of Florida", "Fla."],
+              "normalized_aliases": ["florida", "state of florida", "fla"]}},
+  {"question": "In which city is the Eiffel Tower?",
+   "answer": {"value": "Paris",
+              "aliases": ["Paris", "Paris, France", "Paris (France)"],
+              "normalized_aliases": ["paris", "paris france"]}}
+]

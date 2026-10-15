@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.claude/
+
+# run outputs, caches, checkpoints
+runs/
+outputs/
+precomputed*/
+slurm/logs/
+data/
+checkpoints/
+mlruns/
+*.pt
+*.npz
+*.jsonl
+*.csv
+*.safetensors
+
+# local site files (keep only the example)
+slurm/sites/*.sh
+!slurm/sites/example.sh
