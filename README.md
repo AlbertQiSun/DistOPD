@@ -93,7 +93,17 @@ runs being compared used the same teacher backend and GPU channel.
 
 ## Citation
 
-A BibTeX entry will be added with the arXiv version.
+```tex
+@misc{sun2026rethinkingofflineonpolicydistillation,
+      title={Rethinking Offline On-Policy Distillation: From Scalar Advantages to Distributional Supervision}, 
+      author={Qi Sun and Siyue Zhang and Tingyu Song and Yilun Zhao and Chen Zhao},
+      year={2026},
+      eprint={2611.18648},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2611.18648}, 
+}
+```
 
 ## License
 
